@@ -1,0 +1,31 @@
+name: Update Scryfall Data
+
+on:
+    schedule:
+        - cron: "0 23 * * *"
+    workflow_dispatch:
+
+jobs:
+    update_scryfall_data:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+            
+            - name: Setup Python
+              uses: actions/setup-python@v4
+              with:
+                python-version: "3.12"
+            
+            - name: Install dependencies
+              run: pip install -r requirements.txt
+
+            - name: Update Daily Scryfall Data (Notion)
+              env:
+                NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+                SCRYFALL_COLL_DB_URI: ${{ secrets.SCRYFALL_COLL_DB_URI }}
+                SCRYFALL_CARD_DB_URI: ${{ secrets.SCRYFALL_CARD_DB_URI }}
+                SCRYFALL_APP_PAGE_ID: ${{ secrets.SCRYFALL_APP_PAGE_ID }}
+              run:
+                python update_scryfall_cards.py

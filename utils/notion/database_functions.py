@@ -1,6 +1,26 @@
-import requests, json, time, threading
+import requests, json, ssl
 from requests.adapters import HTTPAdapter
-from requests.exceptions import SSLError, ConnectionError, Timeout
+from urllib3.util.retry import Retry
+
+class NotionTLSAdapter(HTTPAdapter):
+    def init_poolmanager(self, *a, **kw):
+        kw['ssl_context'] = ssl.create_default_context()
+        return super().init_poolmanager(*a, **kw)
+
+def _build_session():
+    s = requests.Session()
+    retry = Retry(
+        total=5, connect=5, read=3, backoff_factor=1.5,
+        status_forcelist=(429,500,502,503,504),
+        allowed_methods=frozenset(["GET","POST","PATCH"]),
+        respect_retry_after_header=True,
+    )
+    adapter = NotionTLSAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount("https://",adapter)
+    return s
+
+SESSION = _build_session()
+TIMEOUT = (10,60)
 
 def get_notion_database_info(headers,database_id,
                              url='https://api.notion.com/v1/databases/'):
@@ -42,6 +62,24 @@ def search_for_notion_page_by_title(
     response = requests.post(query_url,headers=headers,json=payload)
     if response.status_code == 200 and response.json()['results'] != []:
         return response.json()["results"][0]["id"]
+    else:
+        return False
+
+def search_for_notion_page_by_property(
+    headers, dbid, value,
+    prop_name,prop_type
+):
+    query_url = f"https://api.notion.com/v1/databases/{dbid}/query"
+    payload = {
+        "filter": {
+            "property": prop_name,
+            prop_type: { "equals": value}
+        }
+    }
+    
+    response = requests.post(query_url,headers=headers,json=payload)
+    if response.status_code == 200 and response.json()['results'] != []:
+        return response.json()['results'][0]['id']
     else:
         return False
 
@@ -162,28 +200,29 @@ def new_entry_to_notion_database(headers,data):
 
 def get_records_from_notion_database(header,database_id,paginated=False):
     url = f'https://api.notion.com/v1/databases/{database_id}/query'
-    response = requests.post(url,headers=header)
+    # response = requests.post(url,headers=header,json={},timeout=TIMEOUT)
+    response = SESSION.post(url,headers=header,json={},timeout=TIMEOUT)
     response.raise_for_status()
     if paginated:
         return request_paginated_data(url,header)
     return response
 
-def request_paginated_data(url,header):
-    all_data = []
-    has_more = True
-    next_cursor = None
+def request_paginated_data(url,header,page_size=1000):
+    all_data, next_cursor = [], None
 
-    while has_more:
-        payload = {'start_cursor':next_cursor} if next_cursor else {}
-        response = requests.post(url,headers=header,json=payload).json()
-        all_data.extend(response.get('results',[]))
-
-        has_more = response.get('has_more')
-        next_cursor = response.get('next_cursor')
-    
-    print('... Returning {} total records from paginated request.'.format(
-        len(all_data)))
-    return all_data
+    while True:
+        # payload = {'start_cursor':next_cursor} if next_cursor else {}
+        payload = {"page_size": page_size}
+        if next_cursor:
+            payload['start_cursor'] = next_cursor
+        r = SESSION.post(url,headers=header,json=payload,timeout=TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        all_data.extend(data.get('results',[]))
+        # print(f'... Pulled {len(all_data)} records from paginated request.')
+        if not data.get('has_more'):
+            return all_data
+        next_cursor = data.get('next_cursor')
 
 def get_page_name(header,page_id):
     url = f'https://api.notion.com/v1/pages/{page_id}'
