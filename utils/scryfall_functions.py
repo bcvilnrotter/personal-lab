@@ -211,7 +211,7 @@ def build_card_primer(data, page_ids, keychain):
             'physical_card_relation': format_notion_multi_relation(page_ids),
         }
     }
-    cover = scryfall_image(data, "normal")
+    cover = scryfall_image(data, "art_crop")
     if cover:
         primer["cover"] = {"type": "external", "external": {"url": cover}}
     return primer
@@ -221,7 +221,7 @@ def notion_functions(scry_id, response, page_ids, header, keychain):
 
     page_id = search_for_notion_page_by_property(
         headers=header,
-        dbid=keychain['SCRYFALL_CARD_DB_URI'],
+        dbid=keychain['SCRYFALL_CARD_DBID'],
         value=scry_id,
         prop_name='scryfall.id',
         prop_type='rich_text'
@@ -235,7 +235,18 @@ def notion_functions(scry_id, response, page_ids, header, keychain):
                 build_card_primer(card, page_ids, keychain),
                 keychain
             )
-        )     
+        ) 
+        
+    else:
+        update_entry_to_notion_database(
+            headers=header,
+            data=enrich_card_primer(
+                data=card,
+                primer={'properties': {}},
+                keychain=keychain
+            ),
+            page_id=page_id
+        )
 
 def push_daily_scryfall_cards_to_notion(debug=False, **kwargs):
 
