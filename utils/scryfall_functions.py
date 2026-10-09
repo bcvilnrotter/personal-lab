@@ -211,7 +211,7 @@ def build_card_primer(data, page_ids, keychain):
             'physical_card_relation': format_notion_multi_relation(page_ids),
         }
     }
-    cover = scryfall_image(data, "art_crop")
+    cover = scryfall_image(data, "normal")
     if cover:
         primer["cover"] = {"type": "external", "external": {"url": cover}}
     return primer
