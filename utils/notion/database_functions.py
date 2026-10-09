@@ -65,6 +65,24 @@ def search_for_notion_page_by_title(
     else:
         return False
 
+def search_for_notion_page_by_property(
+    headers, dbid, value,
+    prop_name,prop_type
+):
+    query_url = f"https://api.notion.com/v1/databases/{dbid}/query"
+    payload = {
+        "filter": {
+            "property": prop_name,
+            prop_type: { "equals": value}
+        }
+    }
+    
+    response = requests.post(query_url,headers=headers,json=payload)
+    if response.status_code == 200 and response.json()['results'] != []:
+        return response.json()['results'][0]['id']
+    else:
+        return False
+
 def search_for_notion_page_by_datetime(headers,dbid,datetime):
     query_url = f"https://api.notion.com/v1/databases/{dbid}/query"
 
@@ -189,7 +207,7 @@ def get_records_from_notion_database(header,database_id,paginated=False):
         return request_paginated_data(url,header)
     return response
 
-def request_paginated_data(url,header,page_size=100):
+def request_paginated_data(url,header,page_size=1000):
     all_data, next_cursor = [], None
 
     while True:
@@ -201,7 +219,7 @@ def request_paginated_data(url,header,page_size=100):
         r.raise_for_status()
         data = r.json()
         all_data.extend(data.get('results',[]))
-        print(f'... Pulled {len(all_data)} records from paginated request.')
+        # print(f'... Pulled {len(all_data)} records from paginated request.')
         if not data.get('has_more'):
             return all_data
         next_cursor = data.get('next_cursor')
