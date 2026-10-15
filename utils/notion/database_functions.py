@@ -22,6 +22,44 @@ def _build_session():
 SESSION = _build_session()
 TIMEOUT = (10,60)
 
+class NotionLookupError(Exception):
+    """Raised when a Notion lookup fails for a reason other than 'no match'.
+
+    Callers use these lookups to decide between creating and updating a page.
+    A failed query must never be reported as 'no match', or the caller will
+    happily create a duplicate.
+    """
+
+def query_notion_database(headers,dbid,payload=None,context=''):
+    """POST a database query and return its results list.
+
+    Raises NotionLookupError on any non-200 response so that transport or
+    rate-limit failures are never mistaken for an empty result set.
+    """
+    query_url = f"https://api.notion.com/v1/databases/{dbid}/query"
+    response = SESSION.post(
+        query_url,headers=headers,json=payload or {},timeout=TIMEOUT)
+
+    if response.status_code != 200:
+        raise NotionLookupError(
+            f"Notion query failed for database {dbid}"
+            f"{f' ({context})' if context else ''}: "
+            f"{response.status_code} {response.text[:200]}"
+        )
+
+    return response.json().get('results',[])
+
+def _first_match(results,context=''):
+    """Return the first matching page id, or False when there is no match."""
+    if not results:
+        return False
+    if len(results) > 1:
+        print(
+            f"[!]: {len(results)} pages matched {context or 'lookup'}; "
+            f"using {results[0]['id']}. Possible duplicate."
+        )
+    return results[0]['id']
+
 def get_notion_database_info(headers,database_id,
                              url='https://api.notion.com/v1/databases/'):
     return requests.get(url+database_id,headers=headers)
@@ -47,7 +85,6 @@ def search_for_notion_page_by_title(
         headers,dbid,title,
         prop_name="Name",
         lower_case=False):
-    query_url = f"https://api.notion.com/v1/databases/{dbid}/query"
     title_formatted = title.lower() if lower_case else title
     
     payload = {
@@ -59,33 +96,26 @@ def search_for_notion_page_by_title(
         }
     }
 
-    response = requests.post(query_url,headers=headers,json=payload)
-    if response.status_code == 200 and response.json()['results'] != []:
-        return response.json()["results"][0]["id"]
-    else:
-        return False
+    context = f"{prop_name}=={title_formatted}"
+    return _first_match(
+        query_notion_database(headers,dbid,payload,context),context)
 
 def search_for_notion_page_by_property(
     headers, dbid, value,
     prop_name,prop_type
 ):
-    query_url = f"https://api.notion.com/v1/databases/{dbid}/query"
     payload = {
         "filter": {
             "property": prop_name,
             prop_type: { "equals": value}
         }
     }
-    
-    response = requests.post(query_url,headers=headers,json=payload)
-    if response.status_code == 200 and response.json()['results'] != []:
-        return response.json()['results'][0]['id']
-    else:
-        return False
+
+    context = f"{prop_name}=={value}"
+    return _first_match(
+        query_notion_database(headers,dbid,payload,context),context)
 
 def search_for_notion_page_by_datetime(headers,dbid,datetime):
-    query_url = f"https://api.notion.com/v1/databases/{dbid}/query"
-
     payload = {
         "filter": {
             "property": "datetime",
@@ -95,19 +125,15 @@ def search_for_notion_page_by_datetime(headers,dbid,datetime):
         }
     }
 
-    response = requests.post(query_url,headers=headers,json=payload)
-    if response.status_code == 200 and response.json()['results'] != []:
-        return response.json()["results"][0]["id"]
-    else:
-        return False
+    context = f"datetime=={datetime}"
+    return _first_match(
+        query_notion_database(headers,dbid,payload,context),context)
 
 def search_for_last_created_notion_page(
         headers,
         dbid,
         title,
         prop_name="Name"):
-    query_url = f"https://api.notion.com/v1/databases/{dbid}/query"
-
     payload = {
         "filter": {
             "property": prop_name,
@@ -123,15 +149,11 @@ def search_for_last_created_notion_page(
         ]
     }
 
-    response = requests.post(query_url,headers=headers,json=payload)
-    if response.status_code == 200 and response.json()['results'] != []:
-        return response.json()["results"][0]["id"]
-    else:
-        return False
+    results = query_notion_database(
+        headers,dbid,payload,f"{prop_name}=={title}")
+    return results[0]['id'] if results else False
 
 def get_last_created_notion_page_date(headers,dbid):
-    query_url = f"https://api.notion.com/v1/databases/{dbid}/query"
-
     payload = {
         "sorts": [
             {
@@ -141,11 +163,8 @@ def get_last_created_notion_page_date(headers,dbid):
         ]
     }
 
-    response = requests.post(query_url,headers=headers,json=payload)
-    if response.status_code == 200 and response.json()['results'] != []:
-        return response.json()["results"][0]["created_time"]
-    else:
-        return False
+    results = query_notion_database(headers,dbid,payload,'last created page')
+    return results[0]['created_time'] if results else False
 
 def archive_page_from_database(headers,page_id):
     response = requests.patch(
