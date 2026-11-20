@@ -3,38 +3,152 @@ from utils.basic_functions import *
 from utils.notion.basic_functions import *
 from utils.notion.database_functions import *
 from utils.notion.property_formatting import *
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
-def _as_date(value):
-    """Accept a date, or a 'YYYY-MM-DD' / RFC3339 string, and return a date."""
+DEFAULT_LOOKBACK_DAYS = 3
 
-    if isinstance(value, date) and not isinstance(value, datetime):
-        print(f"[+]: Value is already a date: {value}")
-        return value
-    if isinstance(value, datetime):
-        print(f"[+]: Converting datetime to date: {value}")
-        return value.date()
+def _as_datetime(value):
+    """Return a timezone-aware UTC datetime.
 
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    Accepts a datetime, a date (treated as midnight UTC), or an ISO-8601 /
+    RFC3339 string. Naive values are assumed to be UTC. Comparisons in this
+    module use full timestamps, never calendar days, so nothing updated later
+    on the same day as the window start is silently dropped.
+    """
+    if isinstance(value, _dt):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = _dt(value.year, value.month, value.day)
+    else:
+        parsed = _dt.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_tz.utc)
+    return parsed.astimezone(_tz.utc)
 
-def pull_todays_records_useranimelist_from_mal(
-        mal_user,headers,start_date,end_date):
+def resolve_mal_window(start_date=None, end_date='today',
+                       lookback_days=DEFAULT_LOOKBACK_DAYS):
+    """Return the (start, end] window of MAL updates to consider.
 
-    start = _as_date(start_date)
-    end = _as_date(end_date)
+    The window is a fixed look-back from `end_date`, not "since the newest
+    Notion record". Overlapping runs are safe because already-recorded
+    updates are skipped (see `mal_record_already_logged`), so manual runs,
+    delayed schedules, or crashes can no longer open gaps. Pass `start_date`
+    to widen the window for a backfill.
+    """
+    end = _dt.now(_tz.utc) if end_date in (None, 'today') else _as_datetime(end_date)
+    start = (_as_datetime(start_date) if start_date
+             else end - _td(days=float(lookback_days)))
+    if start > end:
+        raise ValueError(f"start_date {start} is after end_date {end}")
+    return start, end
+
+def _create_notion_page_id(headers, data):
+    """Create a page and return its id, or None if creation failed.
+
+    `new_entry_to_notion_database` returns the raw `requests.Response` (or
+    None on failure). Relations need the page id string, not the Response.
+    """
+    response = new_entry_to_notion_database(headers=headers, data=data)
+    if response is None:
+        return None
+    try:
+        return response.json().get('id')
+    except ValueError:
+        return None
+
+def _list_type_filter(list_type):
+    # Records created before manga support have no list_type, so anime
+    # matches "not manga" (Notion's does_not_equal also matches empty selects).
+    return {
+        "property": "list_type",
+        "select": (
+            {"equals": "manga"} if list_type == 'manga'
+            else {"does_not_equal": "manga"}
+        )
+    }
+
+def mal_record_already_logged(mal_record, keychain, headers):
+    """True if this exact MAL update (node.id + list_type + updated_at) is
+    already in the records DB. This is what makes overlapping windows safe."""
+    list_type = mal_record.get('list_type', 'anime')
+    # Notion keeps date properties at minute precision, so compare to the minute.
+    updated_at = _as_datetime(
+        mal_record['list_status']['updated_at']).replace(second=0, microsecond=0)
+    payload = {
+        "filter": {"and": [
+            {"property": "node.id",
+             "rich_text": {"equals": str(mal_record['node']['id'])}},
+            _list_type_filter(list_type),
+        ]},
+        "sorts": [{"timestamp": "created_time", "direction": "descending"}],
+    }
+    results = query_notion_database(
+        headers, keychain['NOTION_MAL_RECORDS_DBID'], payload,
+        f"node.id=={mal_record['node']['id']} ({list_type})")
+    for page in results:
+        logged = (page.get('properties', {})
+                      .get('list_status.updated_at', {})
+                      .get('date') or {}).get('start')
+        if logged and _as_datetime(logged).replace(
+                second=0, microsecond=0) == updated_at:
+            return True
+    return False
+
+MAL_LIST_TYPES = ('anime', 'manga')
+
+# Fields that differ between the anime and manga list_status payloads.
+# Everything else (status, score, updated_at) is shared.
+MAL_LIST_FIELDS = {
+    'anime': {
+        'numbers': ['num_episodes_watched'],
+        'repeat_flag': 'is_rewatching',
+    },
+    'manga': {
+        'numbers': ['num_chapters_read', 'num_volumes_read'],
+        'repeat_flag': 'is_rereading',
+    },
+}
+
+def get_mal_display_title(mal_record):
+    """Title used for Notion page names.
+
+    Anime keep the raw MAL title (unchanged from before manga support).
+    Manga get a ' (Manga)' suffix so an anime and its source manga never
+    collide on the title-based MAL Entries lookup.
+    """
+    title = mal_record['node']['title']
+    if mal_record.get('list_type') == 'manga':
+        return f"{title} (Manga)"
+    return title
+
+def pull_records_from_mal_list(
+        mal_user,headers,start_date,end_date,list_type='anime'):
+    """Pull list entries updated in (start_date, end_date] from one MAL list.
+
+    `list_type` is 'anime' or 'manga'. Each returned record is tagged with
+    `record['list_type']` so downstream code can categorize it.
+    """
+    if list_type not in MAL_LIST_TYPES:
+        raise ValueError(
+            f"list_type must be one of {MAL_LIST_TYPES}, got {list_type!r}")
+
+    start = _as_datetime(start_date)
+    end = _as_datetime(end_date)
     if start > end:
         raise ValueError(f"start_date {start} is after end_date {end}")
 
-    url = f'https://api.myanimelist.net/v2/users/{mal_user}/animelist?fields=list_status&limit=100'
+    url = f'https://api.myanimelist.net/v2/users/{mal_user}/{list_type}list?fields=list_status&limit=100'
 
-    print(f"[+]: Pulling records from MAL for user {mal_user} between {start_date} and {end_date}")
+    print(f"[+]: Pulling {list_type} records from MAL for user {mal_user} between {start_date} and {end_date}")
     records = []
     while True:
         try:
             response = requests.get(url, headers=headers)
             response.raise_for_status()
             date_data = [
-                n for n in response.json()['data'] 
-                if start < _as_date(n["list_status"]["updated_at"]) <= end
+                {**n, 'list_type': list_type}
+                for n in response.json()['data']
+                if start < _as_datetime(n["list_status"]["updated_at"]) <= end
             ]
             records.extend(date_data)
 
@@ -46,7 +160,22 @@ def pull_todays_records_useranimelist_from_mal(
         except Exception as e:
             print(f"[!]: {e}")
             break
-    print(f"[+]: Found {len(records)} records updated between {start_date} and {end_date}")
+    print(f"[+]: Found {len(records)} {list_type} records updated between {start_date} and {end_date}")
+    return records
+
+def pull_todays_records_useranimelist_from_mal(
+        mal_user,headers,start_date,end_date):
+    """Backward-compatible wrapper: anime list only."""
+    return pull_records_from_mal_list(
+        mal_user,headers,start_date,end_date,list_type='anime')
+
+def pull_todays_records_from_mal(
+        mal_user,headers,start_date,end_date,list_types=MAL_LIST_TYPES):
+    """Pull updated entries from every requested MAL list (anime + manga)."""
+    records = []
+    for list_type in list_types:
+        records.extend(pull_records_from_mal_list(
+            mal_user,headers,start_date,end_date,list_type=list_type))
     return records
 
 def build_notion_mal_entries_new_page(mal_record,keychain):
@@ -54,26 +183,32 @@ def build_notion_mal_entries_new_page(mal_record,keychain):
         "parent": {
             "database_id": keychain['NOTION_MAL_ENTRIES_DBID'],
         },
-        "cover": {
-            "type": "external",
-            "external": {
-                "url": mal_record['node']['main_picture']['medium']
-            }
-        },
         "properties": {
             'Name': {
                 'title': [{
                         'text': {
-                            'content': mal_record['node']['title']
+                            'content': get_mal_display_title(mal_record)
                         }
                 }]
             }
         }
     }
 
+    picture = (mal_record['node'].get('main_picture') or {}).get('medium')
+    if picture:
+        update_data['cover'] = {
+            "type": "external",
+            "external": {
+                "url": picture
+            }
+        }
+
     return update_data
 
 def build_notion_mal_record(mal_record,keychain,headers,date,dry_run=False):
+    list_type = mal_record.get('list_type','anime')
+    display_title = get_mal_display_title(mal_record)
+    list_status = mal_record['list_status']
     update_data = {
         "parent": {
             "database_id": keychain['NOTION_MAL_RECORDS_DBID'],
@@ -82,7 +217,7 @@ def build_notion_mal_record(mal_record,keychain,headers,date,dry_run=False):
             'Name': {
                 'title': [{
                         'text': {
-                            'content': f"{mal_record['node']['title']}_{date}"
+                            'content': f"{display_title}_{date}"
                         }
                 }]
             }
@@ -101,23 +236,26 @@ def build_notion_mal_record(mal_record,keychain,headers,date,dry_run=False):
     if mal_record['list_status']['score']:
         update_data['properties']['list_status.score'] = format_notion_number(
             mal_record['list_status']['score'])
-    if mal_record['list_status']['num_episodes_watched']:
-        update_data['properties'][
-            'list_status.num_episodes_watched'] = format_notion_number(
-            mal_record['list_status']['num_episodes_watched'])
+    for field in MAL_LIST_FIELDS[list_type]['numbers']:
+        if list_status.get(field):
+            update_data['properties'][
+                f'list_status.{field}'] = format_notion_number(
+                list_status[field])
     if mal_record['list_status']['updated_at']:
         update_data['properties'][
             'list_status.updated_at'] = format_notion_date(
                 mal_record['list_status']['updated_at'])
-    if mal_record['list_status']['is_rewatching'] is not None:
+    repeat_flag = MAL_LIST_FIELDS[list_type]['repeat_flag']
+    if list_status.get(repeat_flag) is not None:
         update_data['properties'][
-            'list_status.is_rewatching'] = format_notion_checkbox(
-            mal_record['list_status']['is_rewatching'])
+            f'list_status.{repeat_flag}'] = format_notion_checkbox(
+            list_status[repeat_flag])
+    update_data['properties']['list_type'] = format_notion_select(list_type)
 
     entries_page_id = search_for_notion_page_by_title(
         dbid=keychain['NOTION_MAL_ENTRIES_DBID'],
         headers=headers,
-        title=mal_record['node']['title'],)
+        title=display_title,)
 
     print(
         f"[+]: Found MAL Entries page for {mal_record['node']['title']}: {entries_page_id}"
@@ -133,21 +271,24 @@ def build_notion_mal_record(mal_record,keychain,headers,date,dry_run=False):
             print(f"[DRY RUN]: Would create new page in MAL Entries database for {mal_record['node']['title']}")
         else:
 
-            print(f"[+]: Creating new page in MAL Entries database for {mal_record['node']['title']}")
+            print(f"[+]: Creating new page in MAL Entries database for {display_title}")
 
-            update_data['properties'][
-                'MAL Entries'] = format_notion_single_relation(
-                    new_entry_to_notion_database(
-                        headers,
-                        build_notion_mal_entries_new_page(mal_record,keychain)
-                    )
-                )
+            new_entry_id = _create_notion_page_id(
+                headers,
+                build_notion_mal_entries_new_page(mal_record,keychain))
+            if new_entry_id:
+                update_data['properties'][
+                    'MAL Entries'] = format_notion_single_relation(new_entry_id)
+            else:
+                print(f"[!]: Could not create MAL Entries page for {display_title}; record will be written without the relation")
 
     last_page_id = search_for_last_created_notion_page(
         dbid=keychain['NOTION_MAL_RECORDS_DBID'],
         headers=headers,
         title=mal_record['node']['title'],
-        prop_name='node.title')
+        prop_name='node.title',
+        # Keep anime and manga daily-delta chains separate.
+        extra_filters=[_list_type_filter(list_type)])
 
     if last_page_id:
         update_data['properties'][
@@ -171,10 +312,18 @@ def upload_mal_to_notion(
         notion_mal_entries_dbid='NOTION_MAL_ENTRIES_DBID',
         notion_mal_records_dbid='NOTION_MAL_RECORDS_DBID',
         mal_app_page_id='MAL_APP_PAGE_ID',
-        date='today'
+        date='today',
+        list_types=MAL_LIST_TYPES,
+        start_date=None,
+        lookback_days=DEFAULT_LOOKBACK_DAYS
     ):
-    if date == 'today':
-        end_date = dt.now().strftime('%Y-%m-%dT%H:%M:%S%z')
+    """Push MAL anime/manga list updates in (start, end] to Notion.
+
+    `date` is the window end ('today' = now, UTC). `start_date` overrides the
+    default `lookback_days` look-back, e.g. for a backfill.
+    """
+    start, end = resolve_mal_window(
+        start_date=start_date, end_date=date, lookback_days=lookback_days)
 
     keychain = get_keychain([
         'NOTION_TOKEN',
@@ -186,39 +335,51 @@ def upload_mal_to_notion(
     headers = get_notion_header_scalable(
         notion_token=keychain['NOTION_TOKEN'])
 
-    start_date = get_last_created_notion_page_date(
-        headers=headers,
-        dbid=keychain[notion_mal_records_dbid]
-    )
+    print(f"[+]: Window: {start.isoformat()} -> {end.isoformat()} "
+          f"({'start_date override' if start_date else f'{lookback_days}-day look-back'})")
 
-    print(f"[+]: Last created record in Notion database {notion_mal_records_dbid} was on {start_date}")
-
-    daily_useranimelist_records = pull_todays_records_useranimelist_from_mal(
+    mal_records = pull_todays_records_from_mal(
         mal_user=mal_user,
         headers={'X-MAL-CLIENT-ID': keychain[mal_client_id]},
-        start_date=start_date,
-        end_date=end_date
+        start_date=start,
+        end_date=end,
+        list_types=list_types
     )
 
-    if len(daily_useranimelist_records) == 0:
-        print(f"[!]: No records found updated between {start_date} and {end_date}. Exiting.")
+    if len(mal_records) == 0:
+        print(f"[!]: No records found updated between {start.isoformat()} and {end.isoformat()}. Exiting.")
         return
 
-    for record in daily_useranimelist_records:
+    record_date = end.date().isoformat()
+    created = skipped = failed = 0
+    for record in mal_records:
+        label = f"{record['node']['title']} ({record.get('list_type','anime')})"
+        if mal_record_already_logged(record, keychain, headers):
+            print(f"[=]: Already logged {label} @ {record['list_status']['updated_at']}; skipping")
+            skipped += 1
+            continue
+
         notion_record = build_notion_mal_record(
             record,
             keychain,
             headers,
-            dt.fromisoformat(
-                str(end_date).replace("Z", "+00:00")).date().isoformat(),
+            record_date,
             dry_run=dry_run
         )
 
         if dry_run:
             print(f"[DRY RUN]: {notion_record}")
-            return
+            created += 1
+            continue
 
-        new_entry_to_notion_database(
-            headers=headers,
-            data=notion_record
-        )
+        if _create_notion_page_id(headers, notion_record):
+            created += 1
+        else:
+            failed += 1
+
+    print(f"[+]: {'Would create' if dry_run else 'Created'} {created} record(s); "
+          f"skipped {skipped} already logged; {failed} failed.")
+    if failed:
+        # Fail the Action so errors are visible. Failed updates aren't logged,
+        # so the next run's look-back window retries them automatically.
+        raise RuntimeError(f"{failed} MAL record(s) failed to write to Notion")

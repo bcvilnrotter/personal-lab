@@ -9,12 +9,31 @@ cron'd workflow calling a root-level Python script.
 | Workflow | Entrypoint | Schedule (UTC) | Source → Notion |
 |---|---|---|---|
 | iNaturalist Database Update | `update_inaturalist_db.py` | `0 0 * * *` daily | observations, species dictionary |
-| MAL Daily Record Push | `add_daily_mal_records.py` | `0 23 * * *` daily | anime entries + daily records |
+| MAL Daily Record Push | `add_daily_mal_records.py` | `0 23 * * *` daily | anime + manga entries + daily records |
 | Steam Playtime Sync | `add_2week_playtime.py` | `0 23 * * *` daily | 2-week playtime → raw + stats DBs |
 | Update Scryfall Data | `update_scryfall_cards.py` | `0 23 * * *` daily | card metadata, prices, legalities, images |
 | Zotero Authors Verification | `update_zotero_records.py` | `0 0 * * 0` weekly | library items, author reconciliation |
 | Perigon Institution Enrichment | `enrich_institutions_perigon.py`, `update_perigon_stories.py` | `0 0 1 * *` monthly | institution metadata + news stories |
 | Duolingo Daily Sync | `add_duolingo_daily.py` | **manual only** | streak, courses, calendar skills, dictionary |
+
+### MAL → anime + manga records
+
+Each run pulls both MAL lists (`animelist` and `mangalist`) for entries whose
+`list_status.updated_at` falls in a fixed look-back window (default 3 days,
+`--lookback_days`), compared as full UTC timestamps. Any update already in the
+records DB (`NOTION_MAL_RECORDS_DBID`), matched on `node.id` + `list_type` +
+`updated_at` to the minute, is skipped, so overlapping, manual, or re-run
+jobs never duplicate or drop records. New records link to a page in the entries
+DB (`NOTION_MAL_ENTRIES_DBID`). Records carry a `list_type` select (`anime` /
+`manga`); manga entry pages are titled `<title> (Manga)` so they never collide
+with an anime of the same name.
+
+- `--list_types anime` (or `manga`) limits a run to one list.
+- `--start_date 2026-11-01T00:00:00Z` widens the window for a backfill.
+
+Required records-DB properties beyond the original anime set: `list_type`
+(select), `list_status.num_chapters_read` and `list_status.num_volumes_read`
+(number), `list_status.is_rereading` (checkbox).
 
 ### Scryfall → MtG valuation
 
