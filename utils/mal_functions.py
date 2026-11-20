@@ -42,6 +42,20 @@ def resolve_mal_window(start_date=None, end_date='today',
         raise ValueError(f"start_date {start} is after end_date {end}")
     return start, end
 
+def _create_notion_page_id(headers, data):
+    """Create a page and return its id, or None if creation failed.
+
+    `new_entry_to_notion_database` returns the raw `requests.Response` (or
+    None on failure). Relations need the page id string, not the Response.
+    """
+    response = new_entry_to_notion_database(headers=headers, data=data)
+    if response is None:
+        return None
+    try:
+        return response.json().get('id')
+    except ValueError:
+        return None
+
 def _list_type_filter(list_type):
     # Records created before manga support have no list_type, so anime
     # matches "not manga" (Notion's does_not_equal also matches empty selects).
@@ -257,15 +271,16 @@ def build_notion_mal_record(mal_record,keychain,headers,date,dry_run=False):
             print(f"[DRY RUN]: Would create new page in MAL Entries database for {mal_record['node']['title']}")
         else:
 
-            print(f"[+]: Creating new page in MAL Entries database for {mal_record['node']['title']}")
+            print(f"[+]: Creating new page in MAL Entries database for {display_title}")
 
-            update_data['properties'][
-                'MAL Entries'] = format_notion_single_relation(
-                    new_entry_to_notion_database(
-                        headers,
-                        build_notion_mal_entries_new_page(mal_record,keychain)
-                    )
-                )
+            new_entry_id = _create_notion_page_id(
+                headers,
+                build_notion_mal_entries_new_page(mal_record,keychain))
+            if new_entry_id:
+                update_data['properties'][
+                    'MAL Entries'] = format_notion_single_relation(new_entry_id)
+            else:
+                print(f"[!]: Could not create MAL Entries page for {display_title}; record will be written without the relation")
 
     last_page_id = search_for_last_created_notion_page(
         dbid=keychain['NOTION_MAL_RECORDS_DBID'],
@@ -336,7 +351,7 @@ def upload_mal_to_notion(
         return
 
     record_date = end.date().isoformat()
-    created = skipped = 0
+    created = skipped = failed = 0
     for record in mal_records:
         label = f"{record['node']['title']} ({record.get('list_type','anime')})"
         if mal_record_already_logged(record, keychain, headers):
@@ -357,10 +372,14 @@ def upload_mal_to_notion(
             created += 1
             continue
 
-        new_entry_to_notion_database(
-            headers=headers,
-            data=notion_record
-        )
-        created += 1
+        if _create_notion_page_id(headers, notion_record):
+            created += 1
+        else:
+            failed += 1
 
-    print(f"[+]: {'Would create' if dry_run else 'Created'} {created} record(s); skipped {skipped} already logged.")
+    print(f"[+]: {'Would create' if dry_run else 'Created'} {created} record(s); "
+          f"skipped {skipped} already logged; {failed} failed.")
+    if failed:
+        # Fail the Action so errors are visible. Failed updates aren't logged,
+        # so the next run's look-back window retries them automatically.
+        raise RuntimeError(f"{failed} MAL record(s) failed to write to Notion")
