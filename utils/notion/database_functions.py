@@ -133,14 +133,24 @@ def search_for_last_created_notion_page(
         headers,
         dbid,
         title,
-        prop_name="Name"):
+        prop_name="Name",
+        extra_filters=None):
+    """Return the id of the newest page whose `prop_name` equals `title`.
+
+    `extra_filters` is an optional list of Notion filter objects that are
+    AND-ed with the title match (e.g. to scope a lookup to one media type).
+    """
+    title_filter = {
+        "property": prop_name,
+        "title": {
+            "equals": title
+        }
+    }
     payload = {
-        "filter": {
-            "property": prop_name,
-            "title": {
-                "equals": title
-            }
-        },
+        "filter": (
+            {"and": [title_filter, *extra_filters]}
+            if extra_filters else title_filter
+        ),
         "sorts": [
             {
                 "timestamp": "created_time", 
