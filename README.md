@@ -18,13 +18,18 @@ cron'd workflow calling a root-level Python script.
 
 ### MAL → anime + manga records
 
-Each run pulls both MAL lists (`animelist` and `mangalist`) for entries updated
-since the newest page in the records DB (`NOTION_MAL_RECORDS_DBID`), writes one
-record per updated entry, and links it to a page in the entries DB
-(`NOTION_MAL_ENTRIES_DBID`). Records carry a `list_type` select (`anime` /
+Each run pulls both MAL lists (`animelist` and `mangalist`) for entries whose
+`list_status.updated_at` falls in a fixed look-back window (default 3 days,
+`--lookback_days`), compared as full UTC timestamps. Any update already in the
+records DB (`NOTION_MAL_RECORDS_DBID`), matched on `node.id` + `list_type` +
+`updated_at` to the minute, is skipped, so overlapping, manual, or re-run
+jobs never duplicate or drop records. New records link to a page in the entries
+DB (`NOTION_MAL_ENTRIES_DBID`). Records carry a `list_type` select (`anime` /
 `manga`); manga entry pages are titled `<title> (Manga)` so they never collide
-with an anime of the same name. Pass `--list_types anime` (or `manga`) to limit
-a run to one list.
+with an anime of the same name.
+
+- `--list_types anime` (or `manga`) limits a run to one list.
+- `--start_date 2026-11-01T00:00:00Z` widens the window for a backfill.
 
 Required records-DB properties beyond the original anime set: `list_type`
 (select), `list_status.num_chapters_read` and `list_status.num_volumes_read`
